@@ -1,0 +1,123 @@
+import { createClient } from '@/lib/supabase/server'
+import { createAdminClient } from '@/lib/supabase/admin'
+import { createSlackClient, getValidBotToken } from '@/lib/slack/client'
+import { canSendReply } from '@/lib/stripe/helpers'
+import { NextResponse } from 'next/server'
+
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params
+  const supabase = await createClient()
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
+  if (!user) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  // Check reply quota — single query to profiles
+  const { allowed, reason, usage } = await canSendReply(user.id)
+  if (!allowed) {
+    return NextResponse.json(
+      { error: reason, upgrade_required: true, usage },
+      { status: 403 }
+    )
+  }
+
+  const admin = createAdminClient()
+
+  // Atomically claim the lead for reply (prevents double-send race condition)
+  // Only updates if reply_sent is still false — returns empty if another request already claimed it
+  const { data: claimedLead, error: claimError } = await admin
+    .from('leads')
+    .update({ reply_sent: true, reply_sent_at: new Date().toISOString() })
+    .eq('id', id)
+    .eq('user_id', user.id)
+    .eq('reply_sent', false)
+    .select('id, source, suggested_reply, slack_thread_ts, slack_channel_id, reply_sent_at')
+    .single()
+
+  if (claimError || !claimedLead) {
+    // Either lead not found, already sent, or DB error
+    const { data: existing } = await admin
+      .from('leads')
+      .select('reply_sent')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single()
+
+    if (!existing) {
+      return NextResponse.json({ error: 'Lead not found' }, { status: 404 })
+    }
+    if (existing.reply_sent) {
+      return NextResponse.json({ error: 'Reply already sent' }, { status: 409 })
+    }
+    return NextResponse.json({ error: 'Failed to process reply' }, { status: 500 })
+  }
+
+  if (!claimedLead.suggested_reply) {
+    // Undo the claim since there's nothing to send
+    await admin.from('leads').update({ reply_sent: false, reply_sent_at: null }).eq('id', id)
+    return NextResponse.json(
+      { error: 'No suggested reply available' },
+      { status: 400 }
+    )
+  }
+
+  // v1: Only Slack replies
+  if (claimedLead.source !== 'slack') {
+    await admin.from('leads').update({ reply_sent: false, reply_sent_at: null }).eq('id', id)
+    return NextResponse.json(
+      { error: 'Send reply is currently only supported for Slack leads' },
+      { status: 400 }
+    )
+  }
+
+  if (!claimedLead.slack_thread_ts || !claimedLead.slack_channel_id) {
+    await admin.from('leads').update({ reply_sent: false, reply_sent_at: null }).eq('id', id)
+    return NextResponse.json(
+      { error: 'Missing Slack thread information for this lead' },
+      { status: 400 }
+    )
+  }
+
+  // Get bot token — single query to slack_installations with auto-refresh
+  const botToken = await getValidBotToken(user.id)
+  if (!botToken) {
+    await admin.from('leads').update({ reply_sent: false, reply_sent_at: null }).eq('id', id)
+    return NextResponse.json(
+      { error: 'Slack not connected. Please reconnect in Settings.' },
+      { status: 400 }
+    )
+  }
+
+  // Post reply to Slack thread
+  const slack = createSlackClient(botToken)
+  try {
+    await slack.chat.postMessage({
+      channel: claimedLead.slack_channel_id,
+      thread_ts: claimedLead.slack_thread_ts,
+      text: claimedLead.suggested_reply,
+    })
+  } catch (err) {
+    // Undo the claim since Slack send failed
+    await admin.from('leads').update({ reply_sent: false, reply_sent_at: null }).eq('id', id)
+    console.error('Failed to send Slack reply:', err)
+    return NextResponse.json(
+      { error: 'Failed to send reply to Slack. The bot may not have access to this channel.' },
+      { status: 502 }
+    )
+  }
+
+  // Increment reply counter (fire-and-forget is OK — atomic SQL)
+  await admin.rpc('increment_replies_sent', { p_user_id: user.id })
+
+  return NextResponse.json({
+    ok: true,
+    reply_sent: true,
+    reply_sent_at: claimedLead.reply_sent_at,
+  })
+}

@@ -1,0 +1,498 @@
+'use client'
+
+import { useState, useCallback } from 'react'
+import type { Lead } from '@/types/lead'
+
+interface LeadsClientProps {
+  initialLeads: Lead[]
+  initialTotal: number
+  initialTotalPages: number
+  initialConnections: { slack: boolean; email: boolean }
+}
+
+export default function LeadsClient({
+  initialLeads,
+  initialTotal,
+  initialTotalPages,
+  initialConnections,
+}: LeadsClientProps) {
+  const [leads, setLeads] = useState<Lead[]>(initialLeads)
+  const [total, setTotal] = useState(initialTotal)
+  const [page, setPage] = useState(1)
+  const [totalPages, setTotalPages] = useState(initialTotalPages)
+  const [sourceFilter, setSourceFilter] = useState('')
+  const [labelFilter, setLabelFilter] = useState('')
+  const [selectedLead, setSelectedLead] = useState<Lead | null>(null)
+  const [sendingReply, setSendingReply] = useState(false)
+  const [sendReplyError, setSendReplyError] = useState<string | null>(null)
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false)
+  const [replyUsage, setReplyUsage] = useState<{ used: number; limit: number } | null>(null)
+  const [connections] = useState(initialConnections)
+  const [replyCopied, setReplyCopied] = useState(false)
+
+  const fetchLeads = useCallback(async (p: number, source: string, label: string) => {
+    try {
+      const params = new URLSearchParams({ page: p.toString() })
+      if (source) params.set('source', source)
+      if (label) params.set('label', label)
+
+      const res = await fetch(`/api/leads?${params}`)
+      if (!res.ok) return
+      const data = await res.json()
+      setLeads(data.leads ?? [])
+      setTotal(data.total ?? 0)
+      setTotalPages(data.totalPages ?? 1)
+    } catch {
+      // Keep current state on failure
+    }
+  }, [])
+
+  function handleSourceFilter(value: string) {
+    setSourceFilter(value)
+    setPage(1)
+    fetchLeads(1, value, labelFilter)
+  }
+
+  function handleLabelFilter(value: string) {
+    setLabelFilter(value)
+    setPage(1)
+    fetchLeads(1, sourceFilter, value)
+  }
+
+  function handlePageChange(newPage: number) {
+    setPage(newPage)
+    fetchLeads(newPage, sourceFilter, labelFilter)
+  }
+
+  async function submitFeedback(leadId: string, feedback: 'positive' | 'negative') {
+    try {
+      const res = await fetch(`/api/leads/${leadId}/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feedback }),
+      })
+      if (!res.ok) return
+      fetchLeads(page, sourceFilter, labelFilter)
+      if (selectedLead?.id === leadId) {
+        setSelectedLead((prev) =>
+          prev ? { ...prev, feedback, feedback_at: new Date().toISOString() } : null
+        )
+      }
+    } catch {
+      // Silently fail — user can retry
+    }
+  }
+
+  async function sendReply(leadId: string) {
+    setSendingReply(true)
+    setSendReplyError(null)
+    try {
+      const res = await fetch(`/api/leads/${leadId}/send-reply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        if (data.upgrade_required) {
+          setReplyUsage(data.usage || null)
+          setShowUpgradeModal(true)
+        } else {
+          setSendReplyError(data.error || 'Failed to send reply')
+        }
+        return
+      }
+      fetchLeads(page, sourceFilter, labelFilter)
+      if (selectedLead?.id === leadId) {
+        setSelectedLead((prev) =>
+          prev ? { ...prev, reply_sent: true, reply_sent_at: data.reply_sent_at } : null
+        )
+      }
+    } catch {
+      setSendReplyError('Failed to send reply. Please try again.')
+    } finally {
+      setSendingReply(false)
+    }
+  }
+
+  function intentBadge(label: string | null) {
+    if (label === 'high')
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+          HIGH
+        </span>
+      )
+    if (label === 'medium')
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800">
+          MEDIUM
+        </span>
+      )
+    return (
+      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-600">
+        LOW
+      </span>
+    )
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4">
+        <h1 className="text-lg font-semibold text-gray-900">
+          Leads{' '}
+          <span className="text-gray-400 font-normal text-sm">({total})</span>
+        </h1>
+        <div className="flex gap-2">
+          <select
+            value={sourceFilter}
+            onChange={(e) => handleSourceFilter(e.target.value)}
+            className="text-sm border border-gray-300 rounded-md px-2 py-1"
+          >
+            <option value="">All sources</option>
+            <option value="slack">Slack</option>
+            <option value="email">Email</option>
+          </select>
+          <select
+            value={labelFilter}
+            onChange={(e) => handleLabelFilter(e.target.value)}
+            className="text-sm border border-gray-300 rounded-md px-2 py-1"
+          >
+            <option value="">All scores</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select>
+        </div>
+      </div>
+
+      {leads.length === 0 ? (
+        connections.slack || connections.email ? (
+          /* Connected but no leads yet — professional waiting state */
+          <div className="py-16 text-center">
+            <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-green-50 mb-4">
+              <svg className="w-6 h-6 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+              </svg>
+            </div>
+            <h2 className="text-lg font-semibold text-gray-900 mb-1">
+              You&apos;re all set
+            </h2>
+            <p className="text-sm text-gray-500 max-w-sm mx-auto mb-4">
+              Adecis is listening{connections.slack && connections.email ? ' on Slack and email' : connections.slack ? ' on Slack' : ' on email'}.
+              New leads will appear here as soon as they come in.
+            </p>
+            <div className="flex items-center justify-center gap-3 text-xs text-gray-400">
+              {connections.slack && (
+                <span className="inline-flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                  Slack connected
+                </span>
+              )}
+              {connections.email && (
+                <span className="inline-flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                  Email configured
+                </span>
+              )}
+            </div>
+          </div>
+        ) : (
+          /* Not connected — tutorial with mock card */
+          <div className="py-8">
+            <div className="text-center mb-6">
+              <h2 className="text-lg font-semibold text-gray-900">
+                We&apos;ll triage your inbound messages in real time.
+              </h2>
+              <p className="text-sm text-gray-500 mt-1">
+                When a Slack or email message comes in, Adecis scores buying
+                intent and tells you what to do next — in seconds.
+              </p>
+            </div>
+
+            {/* Mock lead card showing what it looks like */}
+            <div className="bg-white rounded-lg shadow-sm border max-w-xl mx-auto opacity-75">
+              <div className="px-4 py-3 border-b border-dashed border-gray-200">
+                <p className="text-[10px] uppercase tracking-wide text-gray-400 text-center">
+                  Example — here&apos;s what a scored lead looks like
+                </p>
+              </div>
+              <div className="px-4 py-3">
+                <div className="flex items-start justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+                      HIGH
+                    </span>
+                    <span className="text-sm font-medium text-gray-900">
+                      Sarah from Maple Bakery
+                    </span>
+                  </div>
+                  <span className="text-xs text-gray-400">Slack</span>
+                </div>
+                <ul className="text-sm text-gray-600 space-y-0.5 mb-2">
+                  <li>• Needs full website redesign, budget $3-5k</li>
+                  <li>• Timeline: launch by March</li>
+                  <li>• Current site is outdated (2019)</li>
+                </ul>
+                <div className="bg-gray-50 rounded-md p-2 text-sm text-gray-500 italic">
+                  &quot;Hi Sarah, thanks for reaching out. A redesign sounds like a
+                  great fit — I&apos;d love to learn more about your vision...&quot;
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-center gap-3 mt-6">
+              <a
+                href="/dashboard/settings"
+                className="text-sm px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+              >
+                Connect Slack or Email
+              </a>
+            </div>
+            <p className="text-center text-xs text-gray-400 mt-3">
+              Go to Settings to connect Slack or set up email forwarding.
+            </p>
+          </div>
+        )
+      ) : (
+        <>
+          <p className="text-xs text-gray-400 mb-3">
+            Showing messages that need your attention.
+          </p>
+          <div className="space-y-2">
+            {leads.map((lead) => (
+              <button
+                key={lead.id}
+                onClick={() => setSelectedLead(lead)}
+                className={`w-full text-left bg-white rounded-lg shadow-sm border px-4 py-3 hover:bg-gray-50 transition-colors ${
+                  lead.intent_label === 'high'
+                    ? 'border-l-4 border-l-green-500'
+                    : lead.intent_label === 'medium'
+                      ? 'border-l-4 border-l-yellow-400'
+                      : 'border-l-4 border-l-gray-200'
+                }`}
+              >
+                <div className="flex items-start justify-between mb-1">
+                  <div className="flex items-center gap-2">
+                    {intentBadge(lead.intent_label)}
+                    <span className="text-sm font-medium text-gray-900">
+                      {lead.sender_name || 'Unknown'}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-xs text-gray-400">
+                      {lead.source === 'slack' ? 'Slack' : 'Email'}
+                    </span>
+                    <span className="text-xs text-gray-300">
+                      {new Date(lead.created_at).toLocaleDateString()}
+                    </span>
+                  </div>
+                </div>
+                {lead.summary_bullets && lead.summary_bullets.length > 0 && (
+                  <ul className="text-xs text-gray-500 space-y-0.5 mt-1">
+                    {lead.summary_bullets.map((b, i) => (
+                      <li key={i}>• {b}</li>
+                    ))}
+                  </ul>
+                )}
+                {!lead.summary_bullets?.length && lead.raw_message && (
+                  <p className="text-xs text-gray-500 mt-1 truncate">
+                    {lead.raw_message.substring(0, 100)}
+                  </p>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {totalPages > 1 && (
+            <div className="flex justify-center gap-2 mt-4">
+              <button
+                onClick={() => handlePageChange(Math.max(1, page - 1))}
+                disabled={page === 1}
+                className="text-sm px-3 py-1 border rounded-md disabled:opacity-30"
+              >
+                Previous
+              </button>
+              <span className="text-sm text-gray-500 px-2 py-1">
+                {page} / {totalPages}
+              </span>
+              <button
+                onClick={() => handlePageChange(Math.min(totalPages, page + 1))}
+                disabled={page === totalPages}
+                className="text-sm px-3 py-1 border rounded-md disabled:opacity-30"
+              >
+                Next
+              </button>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Lead Detail Modal */}
+      {selectedLead && (
+        <div
+          className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4"
+          onClick={() => setSelectedLead(null)}
+        >
+          <div
+            className="bg-white rounded-lg shadow-lg max-w-lg w-full max-h-[80vh] overflow-y-auto p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="font-semibold text-gray-900">
+                Lead from {selectedLead.sender_name || 'Unknown'}
+              </h2>
+              <button
+                onClick={() => setSelectedLead(null)}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2 mb-3">
+              {intentBadge(selectedLead.intent_label)}
+              <span className="text-sm text-gray-500">
+                Score: {selectedLead.intent_score
+                  ? Math.round(selectedLead.intent_score * 100)
+                  : 0}
+                /100
+              </span>
+              <span className="text-xs text-gray-400">
+                via {selectedLead.source}
+              </span>
+            </div>
+
+            {selectedLead.summary_bullets && (
+              <div className="mb-4">
+                <h3 className="text-xs font-medium text-gray-500 uppercase mb-1">
+                  Summary
+                </h3>
+                <ul className="text-sm text-gray-700 space-y-1">
+                  {selectedLead.summary_bullets.map((b, i) => (
+                    <li key={i}>• {b}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {selectedLead.suggested_reply && (
+              <div className="mb-4">
+                <h3 className="text-xs font-medium text-gray-500 uppercase mb-1">
+                  Suggested Reply
+                </h3>
+                <div className="bg-gray-50 rounded-md p-3 text-sm text-gray-700">
+                  {selectedLead.suggested_reply}
+                </div>
+                {sendReplyError && (
+                  <p className="text-xs text-red-500 mt-1">{sendReplyError}</p>
+                )}
+                <div className="flex items-center gap-2 mt-2">
+                  {selectedLead.source === 'slack' &&
+                    selectedLead.slack_thread_ts &&
+                    !selectedLead.reply_sent && (
+                      <button
+                        onClick={() => sendReply(selectedLead.id)}
+                        disabled={sendingReply}
+                        className="text-xs px-3 py-1.5 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        {sendingReply ? 'Sending...' : 'Send Reply'}
+                      </button>
+                    )}
+                  {selectedLead.reply_sent && (
+                    <span className="text-xs text-green-600">
+                      Reply sent
+                      {selectedLead.reply_sent_at && (
+                        <span className="text-gray-400 ml-1">
+                          {new Date(selectedLead.reply_sent_at).toLocaleString()}
+                        </span>
+                      )}
+                    </span>
+                  )}
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(
+                        selectedLead.suggested_reply || ''
+                      )
+                      setReplyCopied(true)
+                      setTimeout(() => setReplyCopied(false), 2000)
+                    }}
+                    className="text-xs text-blue-600 hover:text-blue-700"
+                  >
+                    {replyCopied ? 'Copied!' : 'Copy reply'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="mb-4">
+              <h3 className="text-xs font-medium text-gray-500 uppercase mb-1">
+                Original Message
+              </h3>
+              <div className="bg-gray-50 rounded-md p-3 text-sm text-gray-600 whitespace-pre-wrap">
+                {selectedLead.raw_message}
+              </div>
+            </div>
+
+            {!selectedLead.feedback && (
+              <div className="flex gap-2">
+                <button
+                  onClick={() => submitFeedback(selectedLead.id, 'positive')}
+                  className="text-sm px-3 py-1.5 bg-green-50 text-green-700 rounded-md hover:bg-green-100"
+                >
+                  Helpful
+                </button>
+                <button
+                  onClick={() => submitFeedback(selectedLead.id, 'negative')}
+                  className="text-sm px-3 py-1.5 bg-gray-50 text-gray-600 rounded-md hover:bg-gray-100"
+                >
+                  Not helpful
+                </button>
+              </div>
+            )}
+            {selectedLead.feedback && (
+              <p className="text-xs text-gray-400">
+                Feedback: {selectedLead.feedback === 'positive' ? 'Helpful' : 'Not helpful'}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Upgrade Modal */}
+      {showUpgradeModal && (
+        <div
+          className="fixed inset-0 bg-black/40 flex items-center justify-center z-[60] p-4"
+          onClick={() => setShowUpgradeModal(false)}
+        >
+          <div
+            className="bg-white rounded-lg shadow-lg max-w-sm w-full p-6 text-center"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="font-semibold text-gray-900 text-lg mb-2">
+              Reply limit reached
+            </h2>
+            <p className="text-sm text-gray-600 mb-1">
+              You&apos;ve used all {replyUsage?.limit || 5} free replies this month.
+            </p>
+            <p className="text-sm text-gray-600 mb-4">
+              Upgrade to Pro for unlimited replies, 500 leads/month, and more.
+            </p>
+            <div className="space-y-2">
+              <a
+                href="/dashboard/billing"
+                className="block w-full bg-blue-600 text-white rounded-md px-4 py-2.5 text-sm font-medium hover:bg-blue-700"
+              >
+                Upgrade to Pro — $19/mo
+              </a>
+              <button
+                onClick={() => setShowUpgradeModal(false)}
+                className="w-full text-sm text-gray-500 hover:text-gray-700 py-1"
+              >
+                Maybe later
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
